@@ -22,6 +22,8 @@ const COOLDOWN_MS = 3_000;                  // 3 seconds per user
 const RESULTS_PER_QUERY = 20;
 const RR_CHALLENGE_TIMEOUT_MS = 30_000;     // 30 seconds to accept/decline a challenge
 const RR_TURN_TIMEOUT_MS = 90_000;          // 90 seconds to pull the trigger before AFK kick
+const RRM_LOBBY_TIMEOUT_MS = 45_000;        // 45 seconds to fill the multiplayer lobby
+const RRM_MAX_PLAYERS = 6;
 
 // ─── Startup Validation ───────────────────────────────────────────────────────
 
@@ -78,15 +80,19 @@ const cooldowns = new Map();
 
 // ─── Snipe Stores (keyed by channelId) ───────────────────────────────────────
 
-const deletedMessages = new Map();      // .snipe  — last deleted message
-const deletedMessageStack = new Map();  // .msnipe — up to 25 deleted messages
-const editedMessages = new Map();       // .esnipe — last edited message
+const deletedMessages = new Map();
+const deletedMessageStack = new Map();
+const editedMessages = new Map();
 const MSNIPE_LIMIT = 25;
 
 // ─── Russian Roulette Store (keyed by channelId) ──────────────────────────────
 
 const rrGames = new Map();
 const RR_TOTAL_SHOTS = 6;
+
+// ─── Multiplayer Russian Roulette Store (keyed by channelId) ─────────────────
+
+const rrmGames = new Map();
 
 // ─── Discord Client ───────────────────────────────────────────────────────────
 
@@ -103,7 +109,7 @@ client.once("clientReady", () => {
     console.log(`[Ready] Gateway ping: ${client.ws.ping}ms`);
 });
 
-// ─── Russian Roulette Helpers ─────────────────────────────────────────────────
+// ─── Shared RR Helpers ────────────────────────────────────────────────────────
 
 function shuffle(arr) {
     for (let i = arr.length - 1; i > 0; i--) {
@@ -136,24 +142,19 @@ function shootRow(disabled = false) {
     );
 }
 
-// ─── Russian Roulette Timeouts ────────────────────────────────────────────────
+// ─── Regular RR Timeouts ──────────────────────────────────────────────────────
 
-/**
- * Starts a 30-second timer on a pending challenge.
- * If the challenged player doesn't respond, the challenge is cancelled.
- */
 function scheduleRRChallengeTimeout(cid, channel, challengeMessage) {
     const game = rrGames.get(cid);
     if (!game) return;
 
     game.challengeTimer = setTimeout(async () => {
         const g = rrGames.get(cid);
-        if (!g || !g.pending) return;   // already accepted/declined
+        if (!g || !g.pending) return;
 
         rrGames.delete(cid);
-        console.log(`[RR] Challenge in channel ${cid} expired — no response from ${g.names[g.challenged]}`);
+        console.log(`[RR] Challenge in channel ${cid} expired`);
 
-        // Disable the accept/decline buttons
         const disabledRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("rr_accept").setLabel("✅ Accept").setStyle(ButtonStyle.Success).setDisabled(true),
             new ButtonBuilder().setCustomId("rr_decline").setLabel("❌ Decline").setStyle(ButtonStyle.Secondary).setDisabled(true)
@@ -174,11 +175,6 @@ function scheduleRRChallengeTimeout(cid, channel, challengeMessage) {
     }, RR_CHALLENGE_TIMEOUT_MS);
 }
 
-/**
- * Starts (or resets) the 90-second turn timer once a game is active.
- * If the current player doesn't shoot in time, they are kicked for being AFK
- * and the opponent wins.
- */
 function scheduleRRTurnTimeout(cid, channel, guild) {
     const game = rrGames.get(cid);
     if (!game) return;
@@ -187,10 +183,10 @@ function scheduleRRTurnTimeout(cid, channel, guild) {
 
     game.turnTimer = setTimeout(async () => {
         const g = rrGames.get(cid);
-        if (!g || g.pending) return;    // already ended naturally
+        if (!g || g.pending) return;
 
         rrGames.delete(cid);
-        console.log(`[RR] Turn timed out in channel ${cid} — kicking AFK player ${g.names[g.turn]}`);
+        console.log(`[RR] Turn timed out in channel ${cid}`);
 
         g.gameMessage?.edit({ components: [shootRow(true)] }).catch(() => { });
 
@@ -233,6 +229,185 @@ function clearRRTurnTimeout(game) {
         clearTimeout(game.turnTimer);
         game.turnTimer = null;
     }
+}
+
+// ─── Multiplayer RR Helpers ───────────────────────────────────────────────────
+
+/** Load a fresh gun and shuffle a new turn order for surviving players */
+function freshRRMRound(game) {
+    const chamber = Array(RR_TOTAL_SHOTS).fill(false);
+    chamber[Math.floor(Math.random() * RR_TOTAL_SHOTS)] = true;
+    game.chamber = chamber;
+    game.shotsOrder = shuffle([0, 1, 2, 3, 4, 5]);
+    game.shotsFired = 0;
+    game.turnOrder = shuffle([...game.players]);
+    game.turnIndex = 0;
+    game.turn = game.turnOrder[0];
+    return game;
+}
+
+function buildRRMGame(players) {
+    return freshRRMRound({
+        players: [...players],
+        eliminated: [],
+        round: 1,
+        turn: null,
+        turnOrder: [],
+        turnIndex: 0,
+        shotsFired: 0,
+        chamber: [],
+        shotsOrder: [],
+        gameMessage: null,
+        turnTimer: null
+    });
+}
+
+function rrmPlayerList(players) {
+    return players.map((p, i) => `${i + 1}. **${p.name}**`).join("\n");
+}
+
+function rrmLobbyEmbed(host, players, lobbyClosed = false) {
+    return new EmbedBuilder()
+        .setColor(0xED4245)
+        .setTitle("🔫 Russian Roulette — Multiplayer Lobby")
+        .setDescription(
+            `**${host.name}** opened a multiplayer Russian Roulette lobby!\n\n` +
+            `> 🔴 One bullet, six chambers, random pull order\n` +
+            `> 💀 Each round, one player is eliminated and kicked\n` +
+            `> 🏆 Last survivor wins\n` +
+            `> ⚠️ **Save your server invite before joining!**\n\n` +
+            `**Players (${players.length}/${RRM_MAX_PLAYERS}):**\n` +
+            rrmPlayerList(players)
+        )
+        .setFooter({ text: lobbyClosed ? "Lobby closed." : `45 seconds to join • 2–${RRM_MAX_PLAYERS} players` })
+        .setTimestamp();
+}
+
+function scheduleRRMTurnTimeout(cid, channel, guild) {
+    const game = rrmGames.get(cid);
+    if (!game) return;
+
+    clearRRMTurnTimeout(game);
+
+    game.turnTimer = setTimeout(async () => {
+        const g = rrmGames.get(cid);
+        if (!g) return;
+
+        const afk = g.turn;
+        console.log(`[RRM] Turn timed out in ${cid} — AFK kick: ${afk.name}`);
+
+        g.gameMessage?.edit({ components: [shootRow(true)] }).catch(() => { });
+
+        const afkEmbed = new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle("💤 AFK Detected")
+            .setDescription(
+                `**${afk.name}** didn't pull the trigger in **90 seconds**.\n` +
+                `They are eliminated and kicked for going AFK.`
+            )
+            .setFooter({ text: "90 seconds of no response" })
+            .setTimestamp();
+
+        await channel.send({ embeds: [afkEmbed] }).catch(() => { });
+
+        try {
+            await afk.member.kick("Went AFK during Multiplayer Russian Roulette 💤");
+        } catch {
+            await channel.send(`⚠️ Couldn't kick **${afk.name}** — missing permission or they outrank me.`).catch(() => { });
+        }
+
+        await eliminateRRMPlayer(cid, channel, guild, afk);
+    }, RR_TURN_TIMEOUT_MS);
+}
+
+function clearRRMTurnTimeout(game) {
+    if (game?.turnTimer) {
+        clearTimeout(game.turnTimer);
+        game.turnTimer = null;
+    }
+}
+
+/**
+ * Remove a player after elimination.
+ * Checks win condition, then advances the turn or starts a new round.
+ */
+async function eliminateRRMPlayer(cid, channel, guild, eliminated) {
+    const game = rrmGames.get(cid);
+    if (!game) return;
+
+    clearRRMTurnTimeout(game);
+
+    game.players = game.players.filter(p => p.id !== eliminated.id);
+    game.eliminated.push(eliminated);
+
+    // ── Win condition ──────────────────────────────────────────────────────
+    if (game.players.length === 1) {
+        const winner = game.players[0];
+        rrmGames.delete(cid);
+
+        const winEmbed = new EmbedBuilder()
+            .setColor(0xF1C40F)
+            .setTitle("🏆 We Have a Winner!")
+            .setDescription(
+                `The gun has gone silent.\n\n` +
+                `🥇 **${winner.name}** is the last one standing!\n\n` +
+                `**Elimination order:**\n` +
+                game.eliminated.map((p, i) => `${i + 1}. ~~${p.name}~~`).join("\n")
+            )
+            .setFooter({ text: "Multiplayer Russian Roulette — Better luck next time" })
+            .setTimestamp();
+
+        return channel.send({ embeds: [winEmbed] });
+    }
+
+    // ── Find next alive player in current round's turn order ───────────────
+    let nextTurn = null;
+    for (let i = game.turnIndex + 1; i < game.turnOrder.length; i++) {
+        if (game.players.find(p => p.id === game.turnOrder[i].id)) {
+            game.turnIndex = i;
+            nextTurn = game.turnOrder[i];
+            break;
+        }
+    }
+
+    if (!nextTurn) {
+        // Everyone in the turn order has shot — start next round
+        game.round++;
+        freshRRMRound(game);
+
+        const nextRoundEmbed = new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle(`🔄 Round ${game.round} Begins`)
+            .setDescription(
+                `**${game.players.length} players** remain alive.\n\n` +
+                rrmPlayerList(game.players) + `\n\n` +
+                `A fresh revolver is loaded. Good luck. 🍀\n\n` +
+                `<@${game.turn.id}> goes first this round!`
+            )
+            .setTimestamp();
+
+        const gameMsg = await channel.send({ embeds: [nextRoundEmbed], components: [shootRow(false)] });
+        game.gameMessage = gameMsg;
+        scheduleRRMTurnTimeout(cid, channel, guild);
+        return;
+    }
+
+    game.turn = nextTurn;
+
+    const continueEmbed = new EmbedBuilder()
+        .setColor(0xED4245)
+        .setTitle(`🔫 Round ${game.round} — Keep Going`)
+        .setDescription(
+            `Chamber: ${rrStatusBar(game.shotsFired)}\n` +
+            `Shots fired: **${game.shotsFired}/${game.players.length + game.eliminated.filter(e => game.round === game.round).length}**\n\n` +
+            `<@${game.turn.id}> — it's your turn! 🤞`
+        )
+        .setFooter({ text: `Round ${game.round} • ${game.players.length} players remaining` })
+        .setTimestamp();
+
+    const gameMsg = await channel.send({ embeds: [continueEmbed], components: [shootRow(false)] });
+    game.gameMessage = gameMsg;
+    scheduleRRMTurnTimeout(cid, channel, guild);
 }
 
 // ─── Snipe Helpers ────────────────────────────────────────────────────────────
@@ -343,7 +518,6 @@ function validUrl(url) {
     return "https://images.google.com";
 }
 
-// Separate title truncate to avoid conflict with snipe's truncate
 function truncateTitle(str, max) {
     if (!str) return "Untitled";
     return str.length > max ? str.slice(0, max - 1) + "…" : str;
@@ -413,9 +587,7 @@ client.on("messageCreate", async (message) => {
         const start = Date.now();
         const sent = await message.reply("🏓 Pinging…");
         const rtt = Date.now() - start;
-
         const bar = (ms) => ms < 100 ? "🟢" : ms < 250 ? "🟡" : "🔴";
-
         return sent.edit(
             `🏓 **Pong!**\n` +
             `${bar(rtt)}  Message RTT: **${rtt}ms**\n` +
@@ -436,8 +608,9 @@ client.on("messageCreate", async (message) => {
                 { name: "🗑️ `.snipe`", value: "Show the **last deleted message** in this channel.", inline: false },
                 { name: "📜 `.msnipe`", value: "Show the last **up to 25 deleted messages** in this channel.", inline: false },
                 { name: "✏️ `.esnipe`", value: "Show the **last edited message** in this channel with before/after diff.", inline: false },
-                { name: "🔫 `.rr @user`", value: "Challenge someone to Russian Roulette — 6 chambers, 1 bullet, random pull order. Loser gets kicked. Copy your invite link first!", inline: false },
-                { name: "✅ Accept / ❌ Decline", value: "Use the buttons on the challenge message to accept or back down.", inline: false },
+                { name: "🔫 `.rr @user`", value: "Challenge someone to 1v1 Russian Roulette — 6 chambers, 1 bullet, random pull order. Loser gets kicked.", inline: false },
+                { name: "🔫 `.rrm`", value: "Open a **multiplayer** Russian Roulette lobby (2–6 players). Click ✅ Join to enter, host clicks 🚀 Start. One player is eliminated each round — last alive wins!", inline: false },
+                { name: "✅ Accept / ❌ Decline", value: "Use the buttons on a `.rr` challenge message to accept or back down.", inline: false },
                 { name: "💥 Pull the Trigger", value: "Click the **🔫 Pull the Trigger** button when it's your turn.", inline: false }
             )
             .setFooter({ text: "All snipe commands are channel-specific." })
@@ -449,7 +622,6 @@ client.on("messageCreate", async (message) => {
     // ── .usage ─────────────────────────────────────────────────────────────
     if (lower === `${PREFIX}usage`) {
         console.log(`[Usage] Requested by ${message.author.tag}`);
-
         let ack;
         try {
             ack = await message.reply("⏳ Fetching SerpAPI usage…");
@@ -462,8 +634,6 @@ client.on("messageCreate", async (message) => {
             const { data } = await axios.get("https://serpapi.com/account.json", {
                 params: { api_key: process.env.SERP_API_KEY }
             });
-
-            console.log("[Usage] Response:", JSON.stringify(data));
 
             const pct = data.searches_per_month
                 ? ((data.this_month_usage / data.searches_per_month) * 100).toFixed(1)
@@ -552,6 +722,7 @@ client.on("messageCreate", async (message) => {
         if (target.id === message.author.id) return message.reply("❌ You can't challenge yourself... although that's kinda brave.");
         if (target.user.bot) return message.reply("❌ Bots don't die. Challenge a real person.");
         if (rrGames.has(cid)) return message.reply("❌ A game is already running in this channel. Wait for it to finish.");
+        if (rrmGames.has(cid)) return message.reply("❌ A multiplayer game is already running in this channel.");
 
         const players = [message.author.id, target.id];
         const firstIndex = Math.floor(Math.random() * 2);
@@ -599,13 +770,74 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
+    // ── .rrm — Multiplayer Russian Roulette ────────────────────────────────
+    if (lower === `${PREFIX}rrm`) {
+        if (rrGames.has(cid)) return message.reply("❌ A 1v1 game is already running in this channel.");
+        if (rrmGames.has(cid)) return message.reply("❌ A multiplayer game is already running in this channel.");
+
+        const host = {
+            id: message.author.id,
+            name: message.member.displayName,
+            member: message.member
+        };
+
+        const lobby = {
+            host,
+            players: [host],
+            started: false,
+            lobbyMessage: null,
+            lobbyTimer: null
+        };
+
+        rrmGames.set(cid, lobby);
+
+        const joinRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId("rrm_join")
+                .setLabel("✅ Join")
+                .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+                .setCustomId("rrm_start")
+                .setLabel("🚀 Start Game")
+                .setStyle(ButtonStyle.Primary)
+        );
+
+        const lobbyMsg = await message.channel.send({
+            embeds: [rrmLobbyEmbed(host, lobby.players)],
+            components: [joinRow]
+        });
+
+        lobby.lobbyMessage = lobbyMsg;
+
+        lobby.lobbyTimer = setTimeout(async () => {
+            const g = rrmGames.get(cid);
+            if (!g || g.started) return;
+
+            rrmGames.delete(cid);
+
+            const disabledRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId("rrm_join").setLabel("✅ Join").setStyle(ButtonStyle.Success).setDisabled(true),
+                new ButtonBuilder().setCustomId("rrm_start").setLabel("🚀 Start Game").setStyle(ButtonStyle.Primary).setDisabled(true)
+            );
+            lobbyMsg.edit({ embeds: [rrmLobbyEmbed(host, g.players, true)], components: [disabledRow] }).catch(() => { });
+
+            await message.channel.send({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setDescription("⏰ The lobby expired — not enough players joined in time.")
+                ]
+            });
+        }, RRM_LOBBY_TIMEOUT_MS);
+
+        return;
+    }
+
     // ── .img <query> ───────────────────────────────────────────────────────
     if (trimmed.startsWith(`${PREFIX}img `)) {
         const query = trimmed.slice(PREFIX.length + 4).trim();
-
         if (!query) return message.reply(`Usage: \`${PREFIX}img <search term>\``);
 
-        // Cooldown check
         const now = Date.now();
         const lastUsed = cooldowns.get(message.author.id) ?? 0;
         const remaining = COOLDOWN_MS - (now - lastUsed);
@@ -618,7 +850,6 @@ client.on("messageCreate", async (message) => {
 
         cooldowns.set(message.author.id, now);
 
-        // Cache lookup
         const cacheKey = query.toLowerCase();
         const cached = cache[cacheKey];
         const cacheHit = cached && (now - cached.ts) < CACHE_TTL_MS;
@@ -656,7 +887,6 @@ client.on("messageCreate", async (message) => {
                     }));
 
                 searchTimeMs = Date.now() - fetchStart;
-
                 cache[cacheKey] = { ts: now, images };
                 saveCache(cache);
                 console.log(`[Cache] MISS — fetched "${query}" in ${searchTimeMs}ms`);
@@ -702,7 +932,119 @@ client.on("interactionCreate", async (interaction) => {
 
     const cid = interaction.channel.id;
 
-    // ══ Russian Roulette Buttons ══════════════════════════════════════════════
+    // ══ Multiplayer RR Buttons ════════════════════════════════════════════════
+
+    // ── RRM: Join ──────────────────────────────────────────────────────────
+    if (interaction.customId === "rrm_join") {
+        const lobby = rrmGames.get(cid);
+        if (!lobby || lobby.started) return interaction.reply({ content: "❌ No open lobby here.", ephemeral: true });
+
+        if (lobby.players.find(p => p.id === interaction.user.id)) {
+            return interaction.reply({ content: "❌ You're already in the lobby.", ephemeral: true });
+        }
+        if (lobby.players.length >= RRM_MAX_PLAYERS) {
+            return interaction.reply({ content: `❌ Lobby is full (${RRM_MAX_PLAYERS} players max).`, ephemeral: true });
+        }
+
+        lobby.players.push({
+            id: interaction.user.id,
+            name: interaction.member.displayName,
+            member: interaction.member
+        });
+
+        const isFull = lobby.players.length >= RRM_MAX_PLAYERS;
+        const joinRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("rrm_join").setLabel("✅ Join").setStyle(ButtonStyle.Success).setDisabled(isFull),
+            new ButtonBuilder().setCustomId("rrm_start").setLabel("🚀 Start Game").setStyle(ButtonStyle.Primary)
+        );
+
+        return interaction.update({
+            embeds: [rrmLobbyEmbed(lobby.host, lobby.players)],
+            components: [joinRow]
+        });
+    }
+
+    // ── RRM: Force Start ───────────────────────────────────────────────────
+    if (interaction.customId === "rrm_start") {
+        const lobby = rrmGames.get(cid);
+        if (!lobby || lobby.started) return interaction.reply({ content: "❌ No open lobby here.", ephemeral: true });
+        if (interaction.user.id !== lobby.host.id) {
+            return interaction.reply({ content: "❌ Only the host can start the game.", ephemeral: true });
+        }
+        if (lobby.players.length < 2) {
+            return interaction.reply({ content: "❌ Need at least **2 players** to start.", ephemeral: true });
+        }
+
+        clearTimeout(lobby.lobbyTimer);
+        lobby.started = true;
+
+        const disabledRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("rrm_join").setLabel("✅ Join").setStyle(ButtonStyle.Success).setDisabled(true),
+            new ButtonBuilder().setCustomId("rrm_start").setLabel("🚀 Start Game").setStyle(ButtonStyle.Primary).setDisabled(true)
+        );
+        await interaction.update({ embeds: [rrmLobbyEmbed(lobby.host, lobby.players, true)], components: [disabledRow] });
+
+        const game = buildRRMGame(lobby.players);
+        rrmGames.set(cid, game);
+
+        // DM invite links to all players
+        try {
+            const invite = await interaction.channel.createInvite({
+                maxAge: 3600,
+                maxUses: game.players.length + 2,
+                reason: "RRM safety net invite"
+            });
+
+            const dmEmbed = new EmbedBuilder()
+                .setColor(0xED4245)
+                .setTitle("🔫 Multiplayer Russian Roulette — Your Safety Net")
+                .setDescription(
+                    `The multiplayer game in **${interaction.guild.name}** is starting!\n\n` +
+                    `> ⚠️ If you're eliminated, you'll be **kicked** from the server.\n` +
+                    `> 🔗 Save this invite link to rejoin:\n\n` +
+                    `**${invite.url}**`
+                )
+                .setFooter({ text: "Link expires in 1 hour" })
+                .setTimestamp();
+
+            const dmResults = await Promise.allSettled(
+                game.players.map(p => p.member.user.send({ embeds: [dmEmbed] }))
+            );
+
+            const dmFailed = game.players
+                .filter((_, i) => dmResults[i].status === "rejected")
+                .map(p => p.name);
+
+            if (dmFailed.length > 0) {
+                await interaction.channel.send(
+                    `⚠️ Couldn't DM **${dmFailed.join(", ")}** — they should copy a server invite manually before playing!`
+                );
+            }
+        } catch {
+            await interaction.channel.send("⚠️ Couldn't generate an invite link — check my `Create Instant Invite` permission.");
+        }
+
+        const startEmbed = new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle("🔫 Multiplayer Russian Roulette — Game On!")
+            .setDescription(
+                `**${game.players.length} players** enter. **1** survives.\n\n` +
+                `**Players:**\n` +
+                rrmPlayerList(game.players) + `\n\n` +
+                `🎲 Turn order randomised!\n` +
+                `<@${game.turn.id}> pulls first — good luck! 🤞`
+            )
+            .setFooter({ text: `Round 1 • ${game.players.length} players • 1 bullet per round • random pull order` })
+            .setTimestamp();
+
+        const gameMsg = await interaction.channel.send({ embeds: [startEmbed], components: [shootRow(false)] });
+        game.gameMessage = gameMsg;
+
+        scheduleRRMTurnTimeout(cid, interaction.channel, interaction.guild);
+        return;
+    }
+
+    // ══ Regular RR Buttons ════════════════════════════════════════════════════
 
     // ── Accept ─────────────────────────────────────────────────────────────
     if (interaction.customId === "rr_accept") {
@@ -736,10 +1078,8 @@ client.on("interactionCreate", async (interaction) => {
         const gameMsg = await interaction.channel.send({ embeds: [startEmbed], components: [shootRow(false)] });
         game.gameMessage = gameMsg;
 
-        // Start the AFK timer for the first turn
         scheduleRRTurnTimeout(cid, interaction.channel, interaction.guild);
 
-        // DM invite link to both players
         try {
             const invite = await interaction.channel.createInvite({ maxAge: 3600, maxUses: 2, reason: "Russian Roulette safety net invite" });
 
@@ -805,8 +1145,111 @@ client.on("interactionCreate", async (interaction) => {
         });
     }
 
-    // ── Shoot ──────────────────────────────────────────────────────────────
+    // ── Shoot (handles BOTH .rr and .rrm) ─────────────────────────────────
     if (interaction.customId === "rr_shoot") {
+
+        // ── Check for active RRM game first ───────────────────────────────
+        const rrmGame = rrmGames.get(cid);
+        if (rrmGame && !rrmGame.started === false && rrmGame.eliminated !== undefined) {
+            // It's a live RRM game (has .eliminated — not a lobby)
+            if (interaction.user.id !== rrmGame.turn.id) {
+                return interaction.reply({
+                    content: `⏳ It's not your turn! Wait for <@${rrmGame.turn.id}> to pull the trigger.`,
+                    ephemeral: true
+                });
+            }
+
+            await interaction.update({ components: [shootRow(true)] });
+
+            const chamberSlot = rrmGame.shotsOrder[rrmGame.shotsFired];
+            const bullet = rrmGame.chamber[chamberSlot];
+            rrmGame.shotsFired++;
+            rrmGame.turnIndex = rrmGame.turnOrder.findIndex(p => p.id === rrmGame.turn.id);
+
+            if (bullet) {
+                const loser = rrmGame.turn;
+
+                const deathEmbed = new EmbedBuilder()
+                    .setColor(0x2B2D31)
+                    .setTitle("💀 BANG! Someone's out.")
+                    .setDescription(
+                        `Chamber: ${rrStatusBar(rrmGame.shotsFired - 1)} 💥\n\n` +
+                        `**${loser.name}** pulled the trigger and...\n` +
+                        `> ***BANG!*** The bullet was waiting. 🔴\n\n` +
+                        `💀 **${loser.name}** is eliminated!\n` +
+                        `👢 Kicking them from the server...`
+                    )
+                    .setFooter({ text: `Round ${rrmGame.round} • ${rrmGame.players.length - 1} players remaining` })
+                    .setTimestamp();
+
+                await interaction.channel.send({ embeds: [deathEmbed] });
+                await interaction.channel.send(`😂🤣 **${loser.name}** just got clapped in multiplayer RR lmaooo 💀🔫`);
+
+                try {
+                    await interaction.member.kick("Eliminated in Multiplayer Russian Roulette 🔫");
+                } catch {
+                    await interaction.channel.send(`⚠️ Couldn't kick **${loser.name}** — missing permission or they outrank me.`);
+                }
+
+                await eliminateRRMPlayer(cid, interaction.channel, interaction.guild, loser);
+                return;
+            }
+
+            // *click* — survived. Find next alive player in turn order.
+            const survived = rrmGame.turn;
+            let nextTurn = null;
+
+            for (let i = rrmGame.turnIndex + 1; i < rrmGame.turnOrder.length; i++) {
+                if (rrmGame.players.find(p => p.id === rrmGame.turnOrder[i].id)) {
+                    rrmGame.turnIndex = i;
+                    nextTurn = rrmGame.turnOrder[i];
+                    break;
+                }
+            }
+
+            if (!nextTurn) {
+                // All alive players have shot this round — nobody died, new round
+                rrmGame.round++;
+                freshRRMRound(rrmGame);
+
+                const nextRoundEmbed = new EmbedBuilder()
+                    .setColor(0xED4245)
+                    .setTitle(`🔄 Round ${rrmGame.round} — Nobody Died!`)
+                    .setDescription(
+                        `All **${rrmGame.players.length}** players survived that round. The bullet was a dud!\n\n` +
+                        `🔁 Reloading with a fresh bullet...\n\n` +
+                        rrmPlayerList(rrmGame.players) + `\n\n` +
+                        `<@${rrmGame.turn.id}> goes first this round!`
+                    )
+                    .setTimestamp();
+
+                const gameMsg = await interaction.channel.send({ embeds: [nextRoundEmbed], components: [shootRow(false)] });
+                rrmGame.gameMessage = gameMsg;
+                scheduleRRMTurnTimeout(cid, interaction.channel, interaction.guild);
+                return;
+            }
+
+            rrmGame.turn = nextTurn;
+
+            const clickEmbed = new EmbedBuilder()
+                .setColor(0x57F287)
+                .setTitle("*click* — Empty chamber.")
+                .setDescription(
+                    `Chamber: ${rrStatusBar(rrmGame.shotsFired)}\n` +
+                    `Shots fired this round: **${rrmGame.shotsFired}**\n\n` +
+                    `**${survived.name}** survived this pull. 😮‍💨\n\n` +
+                    `<@${nextTurn.id}> — your turn! 🔫`
+                )
+                .setFooter({ text: `Round ${rrmGame.round} • ${rrmGame.players.length} still alive` })
+                .setTimestamp();
+
+            const gameMsg = await interaction.channel.send({ embeds: [clickEmbed], components: [shootRow(false)] });
+            rrmGame.gameMessage = gameMsg;
+            scheduleRRMTurnTimeout(cid, interaction.channel, interaction.guild);
+            return;
+        }
+
+        // ── Regular 1v1 RR shoot ───────────────────────────────────────────
         const game = rrGames.get(cid);
         if (!game || game.pending) return interaction.reply({ content: "❌ No active game here.", ephemeral: true });
         if (interaction.user.id !== game.turn) {
@@ -893,8 +1336,6 @@ client.on("interactionCreate", async (interaction) => {
 
         const newMsg = await interaction.channel.send({ embeds: [survivedEmbed], components: [shootRow(false)] });
         game.gameMessage = newMsg;
-
-        // Reset the AFK timer for the next player's turn
         scheduleRRTurnTimeout(cid, interaction.channel, interaction.guild);
         return;
     }
