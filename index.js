@@ -20,6 +20,8 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
 const SESSION_TTL_MS = 10 * 60 * 1000;      // 10 minutes
 const COOLDOWN_MS = 3_000;                  // 3 seconds per user
 const RESULTS_PER_QUERY = 20;
+const RR_CHALLENGE_TIMEOUT_MS = 30_000;     // 30 seconds to accept/decline a challenge
+const RR_TURN_TIMEOUT_MS = 90_000;          // 90 seconds to pull the trigger before AFK kick
 
 // ─── Startup Validation ───────────────────────────────────────────────────────
 
@@ -132,6 +134,105 @@ function shootRow(disabled = false) {
             .setStyle(ButtonStyle.Danger)
             .setDisabled(disabled)
     );
+}
+
+// ─── Russian Roulette Timeouts ────────────────────────────────────────────────
+
+/**
+ * Starts a 30-second timer on a pending challenge.
+ * If the challenged player doesn't respond, the challenge is cancelled.
+ */
+function scheduleRRChallengeTimeout(cid, channel, challengeMessage) {
+    const game = rrGames.get(cid);
+    if (!game) return;
+
+    game.challengeTimer = setTimeout(async () => {
+        const g = rrGames.get(cid);
+        if (!g || !g.pending) return;   // already accepted/declined
+
+        rrGames.delete(cid);
+        console.log(`[RR] Challenge in channel ${cid} expired — no response from ${g.names[g.challenged]}`);
+
+        // Disable the accept/decline buttons
+        const disabledRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("rr_accept").setLabel("✅ Accept").setStyle(ButtonStyle.Success).setDisabled(true),
+            new ButtonBuilder().setCustomId("rr_decline").setLabel("❌ Decline").setStyle(ButtonStyle.Secondary).setDisabled(true)
+        );
+        challengeMessage?.edit({ components: [disabledRow] }).catch(() => { });
+
+        const expiredEmbed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle("⏰ Challenge Expired")
+            .setDescription(
+                `**${g.names[g.challenged]}** didn't respond to the challenge in time.\n` +
+                `The game has been cancelled.`
+            )
+            .setFooter({ text: "30 seconds with no response" })
+            .setTimestamp();
+
+        await channel.send({ embeds: [expiredEmbed] }).catch(() => { });
+    }, RR_CHALLENGE_TIMEOUT_MS);
+}
+
+/**
+ * Starts (or resets) the 90-second turn timer once a game is active.
+ * If the current player doesn't shoot in time, they are kicked for being AFK
+ * and the opponent wins.
+ */
+function scheduleRRTurnTimeout(cid, channel, guild) {
+    const game = rrGames.get(cid);
+    if (!game) return;
+
+    clearRRTurnTimeout(game);
+
+    game.turnTimer = setTimeout(async () => {
+        const g = rrGames.get(cid);
+        if (!g || g.pending) return;    // already ended naturally
+
+        rrGames.delete(cid);
+        console.log(`[RR] Turn timed out in channel ${cid} — kicking AFK player ${g.names[g.turn]}`);
+
+        g.gameMessage?.edit({ components: [shootRow(true)] }).catch(() => { });
+
+        const afkId = g.turn;
+        const afkName = g.names[afkId];
+        const winnerId = g.players.find(id => id !== afkId);
+        const winnerName = g.names[winnerId] ?? "The other player";
+
+        const afkEmbed = new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle("💤 AFK Detected — Game Over")
+            .setDescription(
+                `**${afkName}** went AFK and didn't pull the trigger in **90 seconds**.\n\n` +
+                `🏆 **${winnerName}** wins by default!\n` +
+                `👢 Kicking **${afkName}** for going AFK...`
+            )
+            .setFooter({ text: "90 seconds of no response" })
+            .setTimestamp();
+
+        await channel.send({ embeds: [afkEmbed] }).catch(() => { });
+
+        try {
+            const afkMember = await guild.members.fetch(afkId);
+            await afkMember.kick("Went AFK during Russian Roulette 💤");
+        } catch {
+            await channel.send(`⚠️ Couldn't kick **${afkName}** — missing \`Kick Members\` permission or they outrank me.`).catch(() => { });
+        }
+    }, RR_TURN_TIMEOUT_MS);
+}
+
+function clearRRChallengeTimeout(game) {
+    if (game?.challengeTimer) {
+        clearTimeout(game.challengeTimer);
+        game.challengeTimer = null;
+    }
+}
+
+function clearRRTurnTimeout(game) {
+    if (game?.turnTimer) {
+        clearTimeout(game.turnTimer);
+        game.turnTimer = null;
+    }
 }
 
 // ─── Snipe Helpers ────────────────────────────────────────────────────────────
@@ -493,7 +594,9 @@ client.on("messageCreate", async (message) => {
             new ButtonBuilder().setCustomId("rr_decline").setLabel("❌ Decline").setStyle(ButtonStyle.Secondary)
         );
 
-        return message.channel.send({ embeds: [embed], components: [row] });
+        const challengeMsg = await message.channel.send({ embeds: [embed], components: [row] });
+        scheduleRRChallengeTimeout(cid, message.channel, challengeMsg);
+        return;
     }
 
     // ── .img <query> ───────────────────────────────────────────────────────
@@ -608,6 +711,7 @@ client.on("interactionCreate", async (interaction) => {
         if (interaction.user.id !== game.challenged) return interaction.reply({ content: "❌ This challenge isn't for you.", ephemeral: true });
 
         game.pending = false;
+        clearRRChallengeTimeout(game);
         const firstName = game.names[game.turn];
 
         const disabledRow = new ActionRowBuilder().addComponents(
@@ -631,6 +735,9 @@ client.on("interactionCreate", async (interaction) => {
 
         const gameMsg = await interaction.channel.send({ embeds: [startEmbed], components: [shootRow(false)] });
         game.gameMessage = gameMsg;
+
+        // Start the AFK timer for the first turn
+        scheduleRRTurnTimeout(cid, interaction.channel, interaction.guild);
 
         // DM invite link to both players
         try {
@@ -680,6 +787,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!game || !game.pending) return interaction.reply({ content: "❌ No pending challenge here.", ephemeral: true });
         if (interaction.user.id !== game.challenged) return interaction.reply({ content: "❌ This challenge isn't for you.", ephemeral: true });
 
+        clearRRChallengeTimeout(rrGames.get(cid));
         rrGames.delete(cid);
 
         const disabledRow = new ActionRowBuilder().addComponents(
@@ -718,6 +826,7 @@ client.on("interactionCreate", async (interaction) => {
         const nextPlayer = game.players[currentIndex === 0 ? 1 : 0];
 
         if (bullet) {
+            clearRRTurnTimeout(game);
             rrGames.delete(cid);
 
             const loser = interaction.member;
@@ -750,6 +859,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (game.shotsFired >= RR_TOTAL_SHOTS) {
+            clearRRTurnTimeout(game);
             rrGames.delete(cid);
             return interaction.channel.send({
                 embeds: [
@@ -783,6 +893,9 @@ client.on("interactionCreate", async (interaction) => {
 
         const newMsg = await interaction.channel.send({ embeds: [survivedEmbed], components: [shootRow(false)] });
         game.gameMessage = newMsg;
+
+        // Reset the AFK timer for the next player's turn
+        scheduleRRTurnTimeout(cid, interaction.channel, interaction.guild);
         return;
     }
 
