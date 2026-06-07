@@ -1150,7 +1150,8 @@ client.on("interactionCreate", async (interaction) => {
 
         // ── Check for active RRM game first ───────────────────────────────
         const rrmGame = rrmGames.get(cid);
-        if (rrmGame && !rrmGame.started === false && rrmGame.eliminated !== undefined) {
+        if (rrmGame && Array.isArray(rrmGame.eliminated)) {
+            // eliminated array only exists on live games, not lobbies
             // It's a live RRM game (has .eliminated — not a lobby)
             if (interaction.user.id !== rrmGame.turn.id) {
                 return interaction.reply({
