@@ -9,7 +9,8 @@ const {
     EmbedBuilder,
     ActionRowBuilder,
     ButtonBuilder,
-    ButtonStyle
+    ButtonStyle,
+    ActivityType
 } = require("discord.js");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -106,6 +107,11 @@ const client = new Client({
 
 client.once("clientReady", () => {
     console.log(`[Ready] Logged in as ${client.user.tag}`);
+
+    client.user.setActivity('.help', {
+        type: ActivityType.Playing
+    });
+
     console.log(`[Ready] Gateway ping: ${client.ws.ping}ms`);
 });
 
