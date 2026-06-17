@@ -700,9 +700,7 @@ client.on("messageCreate", async (message) => {
             console.error("[AI] API execution failed:", error.response?.data || error.message);
             
             const status = error.response?.status;
-            const apiCode = error.response?.data?.error?.code;
-            
-            if (status === 429 || status === 503 || apiCode === 429 || apiCode === 503) {
+            if (status === 429 || status === 503) {
                 return ack.edit("🐌 **High Demand!** The AI is currently experiencing heavy traffic or you're asking too fast. Please slow down and try again in a moment.");
             }
 
